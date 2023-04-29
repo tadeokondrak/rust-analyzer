@@ -4,16 +4,21 @@
 //! tests. This module also implements a couple of magic tricks, like renaming
 //! `self` and to `self` (to switch between associated function and method).
 
-use hir::{AsAssocItem, InFile, Semantics};
+use hir::{AsAssocItem, DefWithBody, InFile, Semantics};
 use ide_db::{
     base_db::FileId,
     defs::{Definition, NameClass, NameRefClass},
     rename::{bail, format_err, source_edit_from_references, IdentifierKind},
+    search::FileReference,
     RootDatabase,
 };
 use itertools::Itertools;
 use stdx::{always, never};
-use syntax::{ast, utils::is_raw_identifier, AstNode, SmolStr, SyntaxNode, TextRange, TextSize};
+use syntax::{
+    ast::{self, HasArgList},
+    utils::is_raw_identifier,
+    AstNode, SmolStr, SyntaxNode, TextRange, TextSize,
+};
 
 use text_edit::TextEdit;
 
@@ -312,6 +317,52 @@ fn rename_self_to_param(
     source_change.extend(usages.iter().map(|(&file_id, references)| {
         (file_id, source_edit_from_references(references, def, new_name))
     }));
+
+    fn target_type_name(impl_def: &ast::Impl) -> Option<String> {
+        if let Some(ast::Type::PathType(p)) = impl_def.self_ty() {
+            return Some(p.path()?.segment()?.name_ref()?.text().to_string());
+        }
+        None
+    }
+
+    fn method_call_to_call_edit(
+        method_call: &ast::MethodCallExpr,
+        new_path: String,
+    ) -> Option<TextEdit> {
+        let mut text_edit_builder = TextEdit::builder();
+        text_edit_builder.delete(method_call.receiver()?.syntax().text_range());
+        text_edit_builder.delete(method_call.dot_token()?.text_range());
+        text_edit_builder.replace(method_call.name_ref()?.syntax().text_range(), new_path);
+        text_edit_builder.insert(
+            method_call.arg_list()?.l_paren_token()?.text_range().end(),
+            format!("{}, ", method_call.receiver()?.syntax().text()),
+        );
+        Some(text_edit_builder.finish())
+    }
+
+    let DefWithBody::Function(func) = local.parent(sema.db) else { todo!() };
+    let func_def = Definition::Function(func);
+    let func_usages = func_def.usages(sema).all();
+    let impl_def = self_param.syntax().ancestors().find_map(ast::Impl::cast).expect("TODO");
+    let type_name = target_type_name(&impl_def).expect("TODO");
+    source_change.extend(func_usages.iter().flat_map(|(&file_id, references)| {
+        references
+            .iter()
+            .filter_map(|FileReference { name, .. }| match name {
+                ast::NameLike::NameRef(name_ref) => {
+                    name_ref.syntax().parent().and_then(ast::MethodCallExpr::cast)
+                }
+                ast::NameLike::Name(_) | ast::NameLike::Lifetime(_) => None,
+            })
+            .filter_map(|method_call_expr| {
+                method_call_to_call_edit(
+                    &method_call_expr,
+                    format!("{}::{}", type_name, method_call_expr.name_ref()?),
+                )
+            })
+            .map(move |edit| (file_id, edit))
+    }));
+
     Ok(source_change)
 }
 
@@ -1626,6 +1677,13 @@ impl Foo {
         self.i
     }
 }
+
+fn main() {
+    let mut foo = Foo { i: 0 };
+    foo.f();
+    let foo_mut = &mut foo;
+    foo_mut.f();
+}
 "#,
             r#"
 struct Foo { i: i32 }
@@ -1634,6 +1692,50 @@ impl Foo {
     fn f(foo: &mut Foo) -> i32 {
         foo.i
     }
+}
+
+fn main() {
+    let mut foo = Foo { i: 0 };
+    Foo::f(&mut foo);
+    let foo_mut = &mut foo;
+    Foo::f(foo_mut);
+}
+"#,
+        );
+        check(
+            "foo",
+            r#"
+struct Foo { i: i32 }
+
+impl Foo {
+    fn g(&mut $0self, i: u32) {
+        self.i = i;
+    }
+}
+
+fn main() {
+    let mut foo = Foo { i: 0 };
+    foo.g(1);
+    let foo_mut = &mut foo;
+    foo_mut.g(2)
+}
+"#,
+            r#"
+struct Foo { i: i32 }
+
+impl Foo {
+    fn g(self: &mut Foo, i: u32) {
+        self.i = i;
+    }
+}
+
+fn main() {
+    let mut foo = Foo { i: 0 };
+    Foo::f(&mut foo);
+    Foo::g(&mut foo, 1);
+    let foo_mut = &mut foo;
+    Foo::f(foo_mut);
+    Foo::f(foo_mut);
 }
 "#,
         );
@@ -1652,6 +1754,11 @@ impl Foo {
         self.i
     }
 }
+
+fn main() {
+    let foo = Foo { i: 0 };
+    foo.f();
+}
 "#,
             r#"
 struct Foo { i: i32 }
@@ -1660,6 +1767,11 @@ impl Foo {
     fn f(foo: Foo) -> i32 {
         foo.i
     }
+}
+
+fn main() {
+    let foo = Foo { i: 0 };
+    Foo::f(foo);
 }
 "#,
         );
